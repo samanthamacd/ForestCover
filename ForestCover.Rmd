@@ -1,0 +1,248 @@
+---
+title: "Forest Cover Prediction"
+author: "Samantha MacDonald" 
+output: html_document
+date: "2023-11-21"
+---
+
+# Expectations: 
+- 5 slide maximum presentation 
+- at least 3 models tested 
+- recommendations for the future in last slide 
+- up to date github repositories 
+- linkedin and resume updated with all this info
+
+i think i just need to go through the amazon employee access (or the GGG) KCs to compare my code and basically do the same thing that I did there with this KC. 
+
+#### 0.765 #### 
+
+
+preds6 = 0.75... recipe from Kaitlyn, nothing else changed 
+
+
+###########
+### EDA ###
+########### 
+
+this will aid in feature engineering 
+
+
+# This will eventually need to be made into a well-documented Kaggle Notebook # 
+
+```{r}
+library(tidymodels)
+library(dplyr)
+library(recipes)
+library(vroom)
+library(caret)
+library(embed)
+
+forestTrain <- vroom('train.csv')
+forestTest <- vroom('test.csv')
+
+forestTrain$Cover_Type <- as.factor(forestTrain$Cover_Type)
+```
+
+
+# Feature Engineer the Data 
+```{r}
+rec <- recipe(Cover_Type ~ ., data = forestTrain) %>%
+  update_role(Id, new_role = "Id") %>%
+  step_mutate(Id = factor(Id)) %>%
+  step_mutate_at(all_outcomes(), fn = factor, skip = TRUE) %>% 
+  step_lencode_glm(all_nominal_predictors(), outcome = vars(Cover_Type))
+```
+
+# Model 1: Random Forest 
+```{r}
+myMod <- rand_forest(mtry = tune(), min_n = tune(), trees = 500) %>% 
+  set_engine("ranger") %>% 
+  set_mode("classification") 
+
+forest_wf <- workflow() %>% 
+  add_recipe(rec) %>% 
+  add_model(myMod) 
+
+tuningGridForest <- grid_regular(min_n(), mtry(range = c(1,54))) 
+
+folds <- vfold_cv(forestTrain, v=5, repeats=1) 
+
+cvResults <- forest_wf %>% 
+  tune_grid(resamples=folds, 
+            grid = tuningGridForest, 
+            metrics = metric_set(accuracy))
+
+bestTune <- cvResults %>% 
+  select_best("accuracy") 
+
+final_wf <- forest_wf %>% 
+  finalize_workflow(bestTune) %>% 
+  fit(data = forestTrain) 
+
+forestPreds <- predict(final_wf, new_data = forestTest, type = "class") %>%
+  bind_cols(., forestTest) %>%
+  rename(Cover_Type = .pred_class) %>%
+  select(Id, Cover_Type)
+
+vroom_write(forestPreds, "ForestPreds7.csv", delim=",")
+```
+
+
+# Model 2: Neural Networks
+```{r}
+nn_recipe <- recipe(Cover_Type~., data = forestTrain) %>%
+  step_rm(Id) %>%
+  step_zv(all_predictors()) %>% 
+  step_range(all_numeric_predictors(), min=0, max=1) 
+
+# Neural Network Model
+nnModel <- mlp(hidden_units = tune(),
+                epochs = 100) %>% 
+  set_engine("keras") %>%
+  set_mode("classification")
+
+# set workflow
+nnWf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(nnModel)
+
+nn_tuneGrid <- grid_regular(hidden_units(range=c(1, 54)),
+                            levels=3)
+
+# Set up k-fold cross validation and run it
+nn_folds <- vfold_cv(forestTrain, v = 5, repeats = 1)
+
+CV_nn_results <- nnWf %>%
+  tune_grid(resamples = nn_folds,
+            grid = nn_tuneGrid,
+            metrics = metric_set(accuracy))
+
+CV_nn_results %>% collect_metrics() %>% filter(.metric=="accuracy") %>%
+ggplot(aes(x=hidden_units, y=mean)) + geom_line()
+
+# Find Best Tuning Parameters
+bestTune_nn <- CV_nn_results %>%
+  select_best("accuracy")
+
+#finalize workflow and fit it
+final_nn_wf <- nnWf %>%
+  finalize_workflow(bestTune_nn) %>%
+  fit(forestTrain)
+
+pred_nn <- predict(final_nn_wf, new_data = forestTest, type = "class") %>%
+  bind_cols(., forestTest) %>%
+  rename(Cover_Type = .pred_class) %>%
+  select(Id, Cover_Type)
+
+vroom_write(pred_nn, "preds_nn.csv", delim = ",")
+```
+
+
+
+# Model 3: Boosting? idk 
+
+```{r}
+boost_recipe <- recipe(Cover_Type~., data = forestTrain) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_numeric_predictors()) 
+
+boost_model <- boost_tree(trees = 500, learn_rate = 0.01, tree_depth = 2) %>% 
+  set_engine('xgboost') %>% 
+  set_mode("classification") 
+
+boost_wf <- workflow() %>% 
+  add_recipe(boost_recipe) %>% 
+  add_model(boost_model) 
+
+finalwf <- boost_wf %>% 
+  fit(data = forestTrain) 
+
+boost_preds <- predict(finalwf, new_data = forestTest, type = "class") %>%
+  bind_cols(., forestTest) %>%
+  rename(Cover_Type = .pred_class) %>%
+  select(Id, Cover_Type)
+```
+
+
+
+# Now, Stack Them!!! 
+
+```{r}
+library(stacks) 
+
+untunedmodel <- control_stack_grid()
+tunedmodel <- control_stack_resamples()
+
+folds <- vfold_cv(forestTrain, v = 5, repeats = 1) 
+
+# Random Forest 
+
+fMod <- rand_forest(min_n = 1, mtry=15, trees = 500) %>% 
+  set_engine("ranger") %>% 
+  set_mode("classification") 
+
+fWf <- workflow() %>% 
+  add_model(fMod) %>% 
+  add_recipe(rec) 
+
+fModel <- fit_resamples(fWf, 
+                        resamples = folds, 
+                        metrics = metric_set(roc_auc), 
+                        control = tunedmodel) 
+# Neural Networks - should I even include this? 
+
+nnMod <- mlp(hidden_units = 10,
+                epochs = 100) %>%
+  set_engine("keras") %>%
+  set_mode("classification")
+
+nnwf <- 
+  workflow() %>%
+  add_model(nnMod) %>%
+  add_recipe(nn_recipe)
+
+nn_model <-
+  fit_resamples(nnwf,
+                resamples = folds,
+                metrics = metric_set(roc_auc),
+                control = tuned_model)
+
+# Boosted Model 
+
+boost_mod <- boost_tree(trees = 500, learn_rate = 0.01, tree_depth = 2) %>%
+  set_engine('xgboost') %>%
+  set_mode('classification')
+
+boostwf <- 
+  workflow() %>%
+  add_model(boost_mod) %>%
+  add_recipe(boost_recipe)
+
+
+boostmodel <-
+  fit_resamples(boostwf,
+                resamples = folds,
+                metrics = metric_set(roc_auc),
+                control = tunedmodel)
+
+my_stack <- stacks() %>% 
+  add_candidates(boostmodel) %>% 
+  add_candidates(fModel) 
+
+stack_mod <- my_stack %>% 
+  blend_predictions() %>% 
+  fit_members() 
+
+stack_preds <- predict(stack_mod, new_data = forestTest, type = "class") %>%
+  bind_cols(., forestTest) %>%
+  rename(Cover_Type = .pred_class) %>%
+  select(Id, Cover_Type)
+
+vroom_write(stack_preds, 'stacked.csv', delim = ',')
+```
+
+
+
+
+
+
